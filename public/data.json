@@ -1,0 +1,29 @@
+{
+  "defaults": {
+    "inputDataSheetName": "MonReport",
+    "inputDataHeaderRow": 2,
+    "inputDataFirstDataRow": 3,
+    "templateSheetName": "input_template_s",
+    "templateHeaderRow": 1,
+    "templateFirstDataRow": 2,
+    "expectedPcsCount": 553,
+    "roundDecimals": 2
+  },
+  "headerRules": {
+    "dateHeaders": ["date", "日付", "年月日"],
+    "irradiationIncludes": ["積算日射量"],
+    "pcsMustInclude": ["_PCS", "有効電力量"],
+    "pcsIdSplitToken": "_PCS",
+    "templatePcsAnchorPrefix": "pcs_"
+  },
+  "output": {
+    "pcsHeaderFormat": "pcs_{ID}_kwh",
+    "errorsSheetName": "errors"
+  },
+  "validation": {
+    "requirePrevMonthEndRow": true,
+    "skipFirstDataRowInOutput": true,
+    "negativeDiffPolicy": "BLANK_AND_ERROR",
+    "missingPrevDayPolicy": "BLANK_AND_ERROR"
+  }
+}

@@ -1,0 +1,931 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Excel Transfer & PCS Daily Generator</title>
+    
+    <!-- Styles -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    
+    <!-- Libraries (CDN) -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- Use v6.3.0 for better CDN stability without complex dependencies -->
+    <script crossorigin src="https://unpkg.com/history@5/umd/history.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-router@6.3.0/umd/react-router.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-router-dom@6.3.0/umd/react-router-dom.production.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
+
+    <style>
+        body { font-family: 'Inter', sans-serif; }
+        /* Custom Scrollbar for nicer look */
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: #f1f1f1; }
+        ::-webkit-scrollbar-thumb { background: #c1c1c1; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #a8a8a8; }
+        .animate-fade-in { animation: fadeIn 0.5s ease-out; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+    </style>
+</head>
+<body class="bg-gray-50 text-gray-900">
+    <div id="root">
+        <!-- Loading Spinner before React mounts -->
+        <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; color: #666;">
+            <div style="margin-bottom: 1rem; width: 40px; height: 40px; border: 4px solid #e5e7eb; border-top-color: #3b82f6; border-radius: 50%; animation: spin 1s linear infinite;"></div>
+            <p>Loading Application...</p>
+        </div>
+        <style>@keyframes spin { to { transform: rotate(360deg); } }</style>
+    </div>
+
+    <!-- Main Application Script -->
+    <script type="text/babel" data-presets="typescript,react">
+        const { useState, useEffect, createContext, useContext, useMemo } = React;
+        const { HashRouter, Routes, Route, Outlet, NavLink, Navigate } = ReactRouterDOM;
+        
+        // --- Types & Constants ---
+        
+        // Config Types
+        // (Interfaces are purely for TypeScript checking in Babel, runtime objects below)
+        
+        // --- Utils: excel-utils.ts ---
+        const normalizeDate = (value) => {
+            if (!value) return null;
+            let date = null;
+            if (value instanceof Date) {
+                date = value;
+            } else if (typeof value === 'number') {
+                date = new Date(Math.round((value - 25569) * 86400 * 1000));
+            } else if (typeof value === 'string') {
+                const d = new Date(value);
+                if (!isNaN(d.getTime())) date = d;
+            }
+
+            if (date && !isNaN(date.getTime())) {
+                const y = date.getFullYear();
+                const m = String(date.getMonth() + 1).padStart(2, '0');
+                const d = String(date.getDate()).padStart(2, '0');
+                return `${y}-${m}-${d}`;
+            }
+            return null;
+        };
+
+        // --- Logic: pcs-processor.ts ---
+        class PcsProcessor {
+            constructor(config) {
+                this.config = config;
+                this.errors = [];
+            }
+
+            addError(severity, type, message, context) {
+                this.errors.push({
+                    id: Math.random().toString(36).substr(2, 9),
+                    severity,
+                    type,
+                    message,
+                    ...context
+                });
+            }
+
+            async process(inputBuffer, templateBuffer) {
+                this.errors = [];
+                const ExcelJS = window.ExcelJS;
+                const inputWb = new ExcelJS.Workbook();
+                const templateWb = new ExcelJS.Workbook();
+                
+                try { await inputWb.xlsx.load(inputBuffer); } 
+                catch (e) { this.addError('fatal', 'FILE_READ_FAIL', '入力ファイルの読み込みに失敗しました'); return { success: false, errors: this.errors }; }
+
+                try { await templateWb.xlsx.load(templateBuffer); } 
+                catch (e) { this.addError('fatal', 'FILE_READ_FAIL', 'テンプレートファイルの読み込みに失敗しました'); return { success: false, errors: this.errors }; }
+
+                // 1. Validate Input
+                const inputSheet = inputWb.getWorksheet(this.config.defaults.inputDataSheetName);
+                if (!inputSheet) {
+                    this.addError('fatal', 'INPUT_SHEET_NOT_FOUND', `入力シート '${this.config.defaults.inputDataSheetName}' が見つかりません`);
+                    return { success: false, errors: this.errors };
+                }
+
+                const { dateColIdx, pcsCols, irradiationColIdx, dateMap } = this.parseInputData(inputSheet);
+                if (this.errors.some(e => e.severity === 'fatal')) return { success: false, errors: this.errors };
+
+                // 2. Validate Template
+                const templateSheet = templateWb.getWorksheet(this.config.defaults.templateSheetName);
+                if (!templateSheet) {
+                    this.addError('fatal', 'TEMPLATE_SHEET_NOT_FOUND', `テンプレートシート '${this.config.defaults.templateSheetName}' が見つかりません`);
+                    return { success: false, errors: this.errors };
+                }
+
+                const { anchorColIdx, templateDateMap } = this.parseTemplateData(templateSheet);
+                if (this.errors.some(e => e.severity === 'fatal')) return { success: false, errors: this.errors };
+
+                // 3. Generation Logic
+                // CLEANUP: Remove existing PCS columns after the anchor to allow clean overwrite
+                // This ensures "pcs_2_kwh" etc. in the template are removed/overwritten by input data.
+                let colsToRemove = 0;
+                let checkColIdx = anchorColIdx + 1;
+                const headerRowIdx = this.config.defaults.templateHeaderRow;
+                const anchorPrefix = this.config.headerRules.templatePcsAnchorPrefix;
+                
+                // Scan for existing PCS columns to the right of anchor
+                while (true) {
+                    const cell = templateSheet.getRow(headerRowIdx).getCell(checkColIdx);
+                    const val = this.getCellValueAsText(cell);
+                    if (val.startsWith(anchorPrefix)) {
+                        colsToRemove++;
+                        checkColIdx++;
+                    } else {
+                        break;
+                    }
+                }
+                
+                if (colsToRemove > 0) {
+                    templateSheet.spliceColumns(anchorColIdx + 1, colsToRemove);
+                }
+
+                if (pcsCols.length !== this.config.defaults.expectedPcsCount) {
+                    this.addError('warn', 'PCS_COUNT_MISMATCH', `検出されたPCS数(${pcsCols.length})が期待値(${this.config.defaults.expectedPcsCount})と異なります`);
+                }
+                if (pcsCols.length === 0) {
+                    this.addError('fatal', 'PCS_COLS_NOT_FOUND', 'PCS列が見つかりません');
+                    return { success: false, errors: this.errors };
+                }
+
+                // Insert Columns
+                if (pcsCols.length > 1) {
+                    try {
+                        // Fix: Pass empty arrays instead of null to spliceColumns to avoid "reading '0' of null" in ExcelJS
+                        const emptyCols = new Array(pcsCols.length - 1).fill([]); 
+                        templateSheet.spliceColumns(anchorColIdx + 1, 0, ...emptyCols);
+                    } catch (e) {
+                        this.addError('fatal', 'COL_INSERT_FAIL', `PCS列の挿入に失敗しました: ${e.message}`);
+                        return { success: false, errors: this.errors };
+                    }
+                }
+
+                const headerRow = templateSheet.getRow(this.config.defaults.templateHeaderRow);
+                const anchorCol = templateSheet.getColumn(anchorColIdx);
+                const anchorWidth = anchorCol.width;
+                const anchorHeaderCell = headerRow.getCell(anchorColIdx);
+
+                // Set Headers & Styles
+                pcsCols.forEach((pcs, idx) => {
+                    const targetColIdx = anchorColIdx + idx;
+                    const targetCol = templateSheet.getColumn(targetColIdx);
+                    targetCol.width = anchorWidth;
+                    
+                    const headerCell = headerRow.getCell(targetColIdx);
+                    headerCell.value = this.config.output.pcsHeaderFormat.replace('{ID}', pcs.id);
+                    headerCell.style = Object.assign({}, anchorHeaderCell.style);
+                });
+
+                // 4. Fill Data
+                Object.entries(templateDateMap).forEach(([dateStr, tInfo]) => {
+                    const targetRow = templateSheet.getRow(tInfo.rowIndex);
+                    const inputRowInfo = dateMap[dateStr];
+
+                    // Irradiation
+                    if (inputRowInfo && irradiationColIdx !== -1) {
+                        const tIrradColIdx = this.findColIndex(templateSheet, this.config.defaults.templateHeaderRow, this.config.headerRules.irradiationIncludes);
+                        if (tIrradColIdx !== -1) {
+                            const val = inputRowInfo.data[irradiationColIdx];
+                            if (val !== undefined) targetRow.getCell(tIrradColIdx).value = val;
+                            else this.addError('warn', 'IRRADIATION_MISSING', `日射量欠損: ${dateStr}`, { date: dateStr });
+                        }
+                    }
+
+                    if (!inputRowInfo) {
+                        this.addError('warn', 'DATE_NOT_FOUND', `日付 ${dateStr} が入力データに見つかりません`, { date: dateStr });
+                        return;
+                    }
+
+                    // PCS Data
+                    pcsCols.forEach((pcs, idx) => {
+                        const targetColIdx = anchorColIdx + idx;
+                        const cell = targetRow.getCell(targetColIdx);
+                        const anchorCell = targetRow.getCell(anchorColIdx);
+                        cell.style = Object.assign({}, anchorCell.style);
+
+                        // Calc Daily
+                        const currentCum = inputRowInfo.data[pcs.colIndex];
+                        const d = new Date(dateStr);
+                        d.setDate(d.getDate() - 1);
+                        const prevDateStr = normalizeDate(d);
+
+                        if (!prevDateStr || !dateMap[prevDateStr]) {
+                             this.addError('warn', 'MISSING_PREV_DAY', `前日データ欠損: ${dateStr} (PCS: ${pcs.id})`, { date: dateStr, target: pcs.id });
+                             return;
+                        }
+
+                        const prevCum = dateMap[prevDateStr].data[pcs.colIndex];
+                        if (typeof currentCum !== 'number' || typeof prevCum !== 'number') return;
+
+                        let diff = Number((currentCum - prevCum).toFixed(this.config.defaults.roundDecimals));
+
+                        if (diff < 0) {
+                             if (this.config.validation.negativeDiffPolicy === 'ZERO_AND_ERROR') {
+                                 diff = 0;
+                                 this.addError('warn', 'NEGATIVE_DIFF', `負の値検出: ${diff} (PCS: ${pcs.id})`, { date: dateStr, target: pcs.id });
+                             } else if (this.config.validation.negativeDiffPolicy === 'BLANK_AND_ERROR') {
+                                 this.addError('warn', 'NEGATIVE_DIFF', `負の値検出: ${diff} (PCS: ${pcs.id})`, { date: dateStr, target: pcs.id });
+                                 cell.value = null;
+                                 return;
+                             }
+                        }
+                        cell.value = diff;
+                    });
+                });
+
+                await this.generateErrorsSheet(templateWb);
+                return { success: true, errors: this.errors, workbook: templateWb };
+            }
+
+            // Helper to safely get string text from cell
+            getCellValueAsText(cell) {
+                if (!cell) return '';
+                // Try .text (ExcelJS formatted text)
+                if (cell.text !== undefined && cell.text !== null) return cell.text;
+                
+                const val = cell.value;
+                if (val === null || val === undefined) return '';
+                
+                // Handle Rich Text
+                if (typeof val === 'object') {
+                    // Safety check for richText array
+                    if (Array.isArray(val.richText)) {
+                        return val.richText.map(r => r?.text || '').join('');
+                    }
+                    // Safety check for formula result
+                    if (val.result !== undefined && val.result !== null) {
+                         if (typeof val.result === 'object' && val.result.error) return ''; // Skip formula errors
+                         return String(val.result);
+                    }
+                    // Safety check for hyperlink
+                    if (val.text !== undefined) return String(val.text);
+                    
+                    // Fallback for unknown object
+                    return '';
+                }
+                
+                return String(val);
+            }
+
+            findColIndex(sheet, rowIdx, keywords) {
+                const row = sheet.getRow(rowIdx);
+                if (!row) return -1;
+                let found = -1;
+                // use checking cell count to avoid loop issues? No, eachCell is safer for sparse rows.
+                row.eachCell({ includeEmpty: false }, (cell, colNumber) => {
+                    const val = this.getCellValueAsText(cell).toLowerCase();
+                    if (keywords.some(k => val.includes(k.toLowerCase()))) found = colNumber;
+                });
+                return found;
+            }
+
+            findPcsCols(sheet, rowIdx) {
+                const row = sheet.getRow(rowIdx);
+                if (!row) return [];
+                const cols = [];
+                const mustInclude = this.config.headerRules.pcsMustInclude;
+                const splitToken = this.config.headerRules.pcsIdSplitToken;
+                
+                row.eachCell({ includeEmpty: false }, (cell, colNumber) => {
+                    const val = this.getCellValueAsText(cell);
+                    if (mustInclude.every(k => val.includes(k))) {
+                        // Safe split
+                        const parts = val.split(splitToken);
+                        const id = parts && parts.length > 0 ? parts[0] : val;
+                        cols.push({ colIndex: colNumber, id, header: val });
+                    }
+                });
+                return cols;
+            }
+
+            parseInputData(sheet) {
+                const headerRowIdx = this.config.defaults.inputDataHeaderRow;
+                const firstDataRow = this.config.defaults.inputDataFirstDataRow;
+                
+                // Validate Header Row
+                const headerRow = sheet.getRow(headerRowIdx);
+                if (!headerRow || headerRow.cellCount === 0) {
+                     this.addError('fatal', 'HEADER_ROW_EMPTY', `ヘッダ行(${headerRowIdx}行目)が空か、読み取れませんでした。`);
+                     return { dateColIdx: -1, pcsCols: [], irradiationColIdx: -1, dateMap: {}, sortedDates: [] };
+                }
+
+                const dateColIdx = this.findColIndex(sheet, headerRowIdx, this.config.headerRules.dateHeaders);
+                if (dateColIdx === -1) {
+                     this.addError('fatal', 'DATE_COL_NOT_FOUND', `入力データに日付列が見つかりません。ヘッダ行を確認してください。`);
+                     return { dateColIdx: -1, pcsCols: [], irradiationColIdx: -1, dateMap: {}, sortedDates: [] };
+                }
+
+                const irradiationColIdx = this.findColIndex(sheet, headerRowIdx, this.config.headerRules.irradiationIncludes);
+                const pcsCols = this.findPcsCols(sheet, headerRowIdx);
+                
+                if (pcsCols.length === 0) {
+                     this.addError('fatal', 'PCS_COLS_NOT_FOUND', `入力データにPCS列が見つかりません。`);
+                     return { dateColIdx, pcsCols: [], irradiationColIdx, dateMap: {}, sortedDates: [] };
+                }
+
+                const dateMap = {};
+                const sortedDates = []; // Store dates in order for template generation
+
+                sheet.eachRow((row, rowNumber) => {
+                    if (rowNumber < firstDataRow) return;
+                    const dateCell = row.getCell(dateColIdx);
+                    const dateVal = dateCell ? dateCell.value : null;
+                    const normDate = normalizeDate(dateVal);
+                    if (!normDate) return;
+                    
+                    const rowData = {};
+                    row.eachCell({ includeEmpty: true }, (cell, colNumber) => { 
+                        let v = cell.value;
+                        if (v && typeof v === 'object') {
+                            if (v.result !== undefined) v = v.result;
+                            else if (Array.isArray(v.richText)) v = v.richText.map(t=>t?.text || '').join('');
+                        }
+                        rowData[colNumber] = v; 
+                    });
+                    
+                    // Input data check: Ensure we have data
+                    dateMap[normDate] = { rowIndex: rowNumber, data: rowData };
+                    sortedDates.push(normDate);
+                });
+                
+                // Sort dates just in case input is not sorted
+                sortedDates.sort();
+
+                return { dateColIdx, pcsCols, irradiationColIdx, dateMap, sortedDates };
+            }
+
+            async process(inputBuffer, templateBuffer) {
+                this.errors = [];
+                const ExcelJS = window.ExcelJS;
+                const inputWb = new ExcelJS.Workbook();
+                const templateWb = new ExcelJS.Workbook();
+                
+                try { await inputWb.xlsx.load(inputBuffer); } 
+                catch (e) { this.addError('fatal', 'FILE_READ_FAIL', '入力ファイルの読み込みに失敗しました'); return { success: false, errors: this.errors }; }
+
+                try { await templateWb.xlsx.load(templateBuffer); } 
+                catch (e) { this.addError('fatal', 'FILE_READ_FAIL', 'テンプレートファイルの読み込みに失敗しました'); return { success: false, errors: this.errors }; }
+
+                // 1. Validate Input
+                const inputSheet = inputWb.getWorksheet(this.config.defaults.inputDataSheetName);
+                if (!inputSheet) {
+                    this.addError('fatal', 'INPUT_SHEET_NOT_FOUND', `入力シート '${this.config.defaults.inputDataSheetName}' が見つかりません`);
+                    return { success: false, errors: this.errors };
+                }
+
+                const { dateColIdx, pcsCols, irradiationColIdx, dateMap, sortedDates } = this.parseInputData(inputSheet);
+                if (this.errors.some(e => e.severity === 'fatal')) return { success: false, errors: this.errors };
+
+                // 2. Validate Template & Auto-adjust Dates
+                const templateSheet = templateWb.getWorksheet(this.config.defaults.templateSheetName);
+                if (!templateSheet) {
+                    this.addError('fatal', 'TEMPLATE_SHEET_NOT_FOUND', `テンプレートシート '${this.config.defaults.templateSheetName}' が見つかりません`);
+                    return { success: false, errors: this.errors };
+                }
+                
+                // Find Header and Date Col in Template
+                const tHeaderRowIdx = this.config.defaults.templateHeaderRow;
+                const tDateColIdx = this.findColIndex(templateSheet, tHeaderRowIdx, this.config.headerRules.dateHeaders);
+                if (tDateColIdx === -1) {
+                    this.addError('fatal', 'DATE_COL_NOT_FOUND', `テンプレートに日付列が見つかりません`);
+                    return { success: false, errors: this.errors };
+                }
+
+                // --- NEW LOGIC: Update Template Dates based on Input Data ---
+                // Skip the first date (previous month end) as per rules
+                const outputDates = this.config.validation.skipFirstDataRowInOutput ? sortedDates.slice(1) : sortedDates;
+                const tFirstDataRow = this.config.defaults.templateFirstDataRow;
+                
+                // Prepare rows in template
+                // Ensure template has enough rows
+                const requiredRows = outputDates.length;
+                const currentRows = templateSheet.rowCount - tFirstDataRow + 1;
+                
+                // We overwrite date column
+                outputDates.forEach((dateStr, idx) => {
+                    const rowNum = tFirstDataRow + idx;
+                    let row = templateSheet.getRow(rowNum);
+                    // If row doesn't exist (though getRow creates it), ensure styles are consistent if needed
+                    // Set Date
+                    row.getCell(tDateColIdx).value = dateStr; // Write string YYYY-MM-DD. Excel might treat as string.
+                    // Ideally write as Date object if needed, but string YYYY-MM-DD is safe and clear.
+                    // Or parse back to Date for Excel serial? Let's use string for stability as per "match_key".
+                });
+
+                // Clear excess rows if template had more rows
+                // But be careful not to delete footer if exists. Assuming template is just data list.
+                // We'll just leave them or clear? Better clear to avoid confusion.
+                // For safety, let's strictly process only `outputDates` count.
+
+                const { anchorColIdx } = this.parseTemplateData(templateSheet); // Re-parse to find anchor
+                if (this.errors.some(e => e.severity === 'fatal')) return { success: false, errors: this.errors };
+
+                // 3. Generation Logic (PCS Columns)
+                // Set Headers & Styles
+                const headerRow = templateSheet.getRow(tHeaderRowIdx);
+                const anchorCol = templateSheet.getColumn(anchorColIdx);
+                // Deep copy style to avoid reference issues
+                const anchorStyle = JSON.parse(JSON.stringify(anchorCol.style || {}));
+                const anchorWidth = anchorCol.width;
+                const anchorHeaderCell = headerRow.getCell(anchorColIdx);
+                const anchorHeaderStyle = JSON.parse(JSON.stringify(anchorHeaderCell.style || {}));
+
+                pcsCols.forEach((pcs, idx) => {
+                    const targetColIdx = anchorColIdx + idx;
+                    const targetCol = templateSheet.getColumn(targetColIdx);
+                    targetCol.width = anchorWidth;
+                    
+                    const headerCell = headerRow.getCell(targetColIdx);
+                    headerCell.value = this.config.output.pcsHeaderFormat.replace('{ID}', pcs.id);
+                    headerCell.style = anchorHeaderStyle;
+                });
+
+                // 4. Fill Data
+                // Use outputDates loop to fill data
+                outputDates.forEach((dateStr, idx) => {
+                    const rowNum = tFirstDataRow + idx;
+                    const targetRow = templateSheet.getRow(rowNum);
+                    const inputRowInfo = dateMap[dateStr];
+                    
+                    // Capture anchor cell style for this row to copy to new PCS cells
+                    const anchorCell = targetRow.getCell(anchorColIdx);
+                    const rowAnchorStyle = JSON.parse(JSON.stringify(anchorCell.style || {}));
+
+                    // Irradiation
+                    if (inputRowInfo && irradiationColIdx !== -1) {
+                        const tIrradColIdx = this.findColIndex(templateSheet, tHeaderRowIdx, this.config.headerRules.irradiationIncludes);
+                        if (tIrradColIdx !== -1) {
+                            const val = inputRowInfo.data[irradiationColIdx];
+                            if (val !== undefined) targetRow.getCell(tIrradColIdx).value = val;
+                            else this.addError('warn', 'IRRADIATION_MISSING', `日射量欠損: ${dateStr}`, { date: dateStr });
+                        }
+                    }
+
+                    if (!inputRowInfo) {
+                        this.addError('warn', 'DATE_NOT_FOUND', `日付 ${dateStr} が入力データに見つかりません`, { date: dateStr });
+                        return; // Continue to next date
+                    }
+
+                    // PCS Data
+                    pcsCols.forEach((pcs, idx) => {
+                        const targetColIdx = anchorColIdx + idx;
+                        const cell = targetRow.getCell(targetColIdx);
+                        
+                        // Copy style safely
+                        cell.style = rowAnchorStyle;
+
+                        // Calc Daily
+                        const currentCum = inputRowInfo.data[pcs.colIndex];
+                        
+                        // Find prev date logic
+                        const d = new Date(dateStr);
+                        d.setDate(d.getDate() - 1);
+                        const prevDateStr = normalizeDate(d);
+
+                        if (!prevDateStr || !dateMap[prevDateStr]) {
+                             // Special case: if this is the first output date, prev date should be in dateMap (which includes skipFirstDataRow)
+                             // If it's missing from dateMap, it's a real error
+                             this.addError('warn', 'MISSING_PREV_DAY', `前日データ欠損: ${dateStr} (PCS: ${pcs.id})`, { date: dateStr, target: pcs.id });
+                             return;
+                        }
+
+                        const prevCum = dateMap[prevDateStr].data[pcs.colIndex];
+                        if (typeof currentCum !== 'number' || typeof prevCum !== 'number') return;
+
+                        let diff = Number((currentCum - prevCum).toFixed(this.config.defaults.roundDecimals));
+
+                        if (diff < 0) {
+                             if (this.config.validation.negativeDiffPolicy === 'ZERO_AND_ERROR') {
+                                 diff = 0;
+                                 this.addError('warn', 'NEGATIVE_DIFF', `負の値検出: ${diff} (PCS: ${pcs.id})`, { date: dateStr, target: pcs.id });
+                             } else if (this.config.validation.negativeDiffPolicy === 'BLANK_AND_ERROR') {
+                                 this.addError('warn', 'NEGATIVE_DIFF', `負の値検出: ${diff} (PCS: ${pcs.id})`, { date: dateStr, target: pcs.id });
+                                 cell.value = null;
+                                 return;
+                             }
+                        }
+                        cell.value = diff;
+                    });
+                });
+
+                await this.generateErrorsSheet(templateWb);
+                return { success: true, errors: this.errors, workbook: templateWb };
+            }
+
+
+            parseTemplateData(sheet) {
+                const headerRowIdx = this.config.defaults.templateHeaderRow;
+                const firstDataRow = this.config.defaults.templateFirstDataRow;
+                const anchorPrefix = this.config.headerRules.templatePcsAnchorPrefix;
+
+                let anchorColIdx = -1;
+                // Use getRow safely
+                const headerRow = sheet.getRow(headerRowIdx);
+                headerRow.eachCell((cell, colNumber) => {
+                    const val = this.getCellValueAsText(cell);
+                    if (anchorColIdx === -1 && val.startsWith(anchorPrefix)) anchorColIdx = colNumber;
+                });
+
+                if (anchorColIdx === -1) {
+                    this.addError('fatal', 'TEMPLATE_PCS_ANCHOR_NOT_FOUND', `テンプレートにPCSアンカー列(${anchorPrefix}...)が見つかりません`);
+                    return { anchorColIdx: -1, templateDateMap: {} };
+                }
+
+                const dateColIdx = this.findColIndex(sheet, headerRowIdx, this.config.headerRules.dateHeaders);
+                if (dateColIdx === -1) {
+                    this.addError('fatal', 'DATE_COL_NOT_FOUND', `テンプレートに日付列が見つかりません`);
+                    return { anchorColIdx, templateDateMap: {} };
+                }
+
+                const templateDateMap = {};
+                sheet.eachRow((row, rowNumber) => {
+                    if (rowNumber < firstDataRow) return;
+                    const dateVal = row.getCell(dateColIdx).value;
+                    const normDate = normalizeDate(dateVal);
+                    if (normDate) templateDateMap[normDate] = { rowIndex: rowNumber, data: {} };
+                });
+                return { anchorColIdx, templateDateMap };
+            }
+
+            async generateErrorsSheet(wb) {
+                const sheetName = this.config.output.errorsSheetName;
+                let sheet = wb.getWorksheet(sheetName);
+                if (sheet) wb.removeWorksheet(sheet.id);
+                sheet = wb.addWorksheet(sheetName);
+                sheet.columns = [
+                    { header: 'Severity', key: 'severity', width: 10 },
+                    { header: 'Type', key: 'type', width: 20 },
+                    { header: 'Date', key: 'date', width: 15 },
+                    { header: 'Target', key: 'target', width: 15 },
+                    { header: 'Message', key: 'message', width: 50 },
+                ];
+                this.errors.forEach(err => sheet.addRow(err));
+            }
+        }
+
+        // --- Context: ConfigContext ---
+        const ConfigContext = createContext();
+        const LOCAL_STORAGE_KEY = 'pcs_generator_config';
+
+        const ConfigProvider = ({ children }) => {
+            const [defaultConfig, setDefaultConfig] = useState(null);
+            const [config, setConfig] = useState(null);
+            const [status, setStatus] = useState('loading');
+            const [error, setError] = useState(null);
+
+            const fetchConfig = async () => {
+                setStatus('loading');
+                try {
+                    const response = await fetch('./data.json');
+                    if (!response.ok) throw new Error('Failed to fetch config');
+                    const data = await response.json();
+                    setDefaultConfig(data);
+                    
+                    const stored = localStorage.getItem(LOCAL_STORAGE_KEY);
+                    if (stored) {
+                        try { setConfig(JSON.parse(stored)); } 
+                        catch { setConfig(data); }
+                    } else {
+                        setConfig(data);
+                    }
+                    setStatus('ready');
+                } catch (err) {
+                    setError(err.message);
+                    setStatus('error');
+                }
+            };
+
+            const updateConfig = (newConfig) => {
+                setConfig(newConfig);
+                localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(newConfig));
+            };
+
+            const resetConfig = () => {
+                if (defaultConfig) {
+                    setConfig(defaultConfig);
+                    localStorage.removeItem(LOCAL_STORAGE_KEY);
+                }
+            };
+
+            useEffect(() => { fetchConfig(); }, []);
+
+            return (
+                <ConfigContext.Provider value={{ config, status, error, reloadConfig: fetchConfig, updateConfig, resetConfig }}>
+                    {children}
+                </ConfigContext.Provider>
+            );
+        };
+        const useConfig = () => useContext(ConfigContext);
+
+        // --- Context: ProcessingContext ---
+        const ProcessingContext = createContext();
+        const ProcessingProvider = ({ children }) => {
+            const [errors, setErrors] = useState([]);
+            const [resultWorkbook, setResultWorkbook] = useState(null);
+            const [isProcessing, setIsProcessing] = useState(false);
+            return (
+                <ProcessingContext.Provider value={{ errors, setErrors, resultWorkbook, setResultWorkbook, isProcessing, setIsProcessing }}>
+                    {children}
+                </ProcessingContext.Provider>
+            );
+        };
+        const useProcessing = () => useContext(ProcessingContext);
+
+        // --- Components ---
+        const Navbar = () => {
+            const navItems = [
+                { path: '/', label: '変換', icon: 'fa-file-import' },
+                { path: '/errors', label: 'エラー', icon: 'fa-triangle-exclamation' },
+                { path: '/about', label: 'About', icon: 'fa-circle-info' },
+            ];
+            return (
+                <nav className="bg-white border-b border-gray-200 sticky top-0 z-50">
+                    <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                        <div className="flex justify-between h-16">
+                            <div className="flex">
+                                <div className="flex-shrink-0 flex items-center">
+                                    <i className="fa-solid fa-sun text-2xl text-blue-500"></i>
+                                    <span className="ml-2 text-xl font-bold text-gray-900 hidden sm:block">PCS Generator</span>
+                                </div>
+                                <div className="ml-6 flex space-x-4">
+                                    {navItems.map((item) => (
+                                        <NavLink key={item.path} to={item.path}
+                                            className={({ isActive }) => `inline-flex items-center px-3 py-2 border-b-2 text-sm font-medium ${isActive ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-500 hover:border-gray-300 hover:text-gray-700'}`}>
+                                            <i className={`fa-solid ${item.icon} mr-2`}></i> {item.label}
+                                        </NavLink>
+                                    ))}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </nav>
+            );
+        };
+
+        const Layout = () => {
+            const { status, error, reloadConfig } = useConfig();
+            if (status === 'loading') return (
+                <div className="min-h-screen flex items-center justify-center bg-gray-50">
+                    <i className="fa-solid fa-spinner fa-spin text-4xl text-blue-500"></i>
+                </div>
+            );
+            if (status === 'error') return (
+                <div className="min-h-screen flex items-center justify-center bg-gray-50 p-4">
+                    <div className="bg-white p-6 rounded-lg shadow-lg text-center">
+                        <i className="fa-solid fa-circle-exclamation text-4xl text-red-500 mb-4"></i>
+                        <h2 className="text-xl font-bold mb-2">設定の読み込みに失敗しました</h2>
+                        <button onClick={reloadConfig} className="bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600">リトライ</button>
+                    </div>
+                </div>
+            );
+            return (
+                <div className="min-h-screen bg-gray-50">
+                    <Navbar />
+                    <main className="max-w-7xl mx-auto py-6 sm:px-6 lg:px-8">
+                        <Outlet />
+                    </main>
+                </div>
+            );
+        };
+
+        // --- Pages ---
+        const ConvertPage = () => {
+            const { config } = useConfig();
+            const { setErrors, setResultWorkbook, resultWorkbook, isProcessing, setIsProcessing } = useProcessing();
+            const [inputDataFile, setInputDataFile] = useState(null);
+            const [summary, setSummary] = useState(null);
+
+            const handleValidate = async () => {
+                if (!config || !inputDataFile) return;
+                setIsProcessing(true);
+                setSummary(null);
+                setErrors([]);
+                setResultWorkbook(null);
+                await new Promise(r => setTimeout(r, 100)); // UI update
+
+                try {
+                    const inputBuffer = await inputDataFile.arrayBuffer();
+                    
+                    // Fetch internal template
+                    let templateBuffer;
+                    try {
+                        const templateRes = await fetch('./input_template.xlsx');
+                        if (!templateRes.ok) throw new Error('テンプレートファイル(input_template.xlsx)が見つかりません');
+                        templateBuffer = await templateRes.arrayBuffer();
+                    } catch (e) {
+                        alert('テンプレート読み込みエラー: ' + e.message);
+                        setIsProcessing(false);
+                        return;
+                    }
+
+                    const processor = new PcsProcessor(config);
+                    const result = await processor.process(inputBuffer, templateBuffer);
+                    
+                    setErrors(result.errors);
+                    const fatal = result.errors.filter(e => e.severity === 'fatal').length;
+                    const warn = result.errors.filter(e => e.severity === 'warn').length;
+                    setSummary({ fatal, warn });
+                    if (result.success && result.workbook) setResultWorkbook(result.workbook);
+                } catch (e) {
+                    console.error(e);
+                    alert('処理エラー: ' + e.message);
+                } finally {
+                    setIsProcessing(false);
+                }
+            };
+
+            const handleDownload = async () => {
+                if (!resultWorkbook) return;
+                const buffer = await resultWorkbook.xlsx.writeBuffer();
+                saveAs(new Blob([buffer]), 'filled_template.xlsx');
+            };
+
+            const FileCard = ({ label, file, setFile }) => (
+                <div className="col-span-6 sm:col-span-4">
+                    <label className="block text-sm font-medium text-gray-700">{label}</label>
+                    <div className="mt-1 flex justify-center px-6 pt-5 pb-6 border-2 border-gray-300 border-dashed rounded-md hover:border-blue-500 transition-colors bg-gray-50">
+                        <div className="space-y-1 text-center">
+                            {file ? (
+                                <div className="flex flex-col items-center">
+                                    <i className="fa-solid fa-file-excel text-4xl text-green-600 mb-2"></i>
+                                    <p className="text-sm font-medium text-gray-900">{file.name}</p>
+                                    <p className="text-xs text-gray-500">{(file.size / 1024).toFixed(1)} KB</p>
+                                    <button onClick={() => setFile(null)} className="text-xs text-red-500 hover:text-red-700 mt-2 underline">解除</button>
+                                </div>
+                            ) : (
+                                <>
+                                    <i className="fa-solid fa-cloud-arrow-up text-4xl text-gray-400 mb-2"></i>
+                                    <div className="flex text-sm text-gray-600 justify-center">
+                                        <label className="relative cursor-pointer bg-white rounded-md font-medium text-blue-600 hover:text-blue-500">
+                                            <span>ファイルを選択</span>
+                                            <input type="file" className="sr-only" accept=".xlsx, .xls" onChange={(e) => e.target.files && setFile(e.target.files[0])} />
+                                        </label>
+                                    </div>
+                                    <p className="text-xs text-gray-500">Excel files (.xlsx)</p>
+                                </>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            );
+
+            return (
+                <div className="space-y-6">
+                    <div className="bg-white shadow px-4 py-5 sm:rounded-lg sm:p-6">
+                        <div className="md:grid md:grid-cols-3 md:gap-6">
+                            <div className="md:col-span-1">
+                                <h3 className="text-lg font-medium leading-6 text-gray-900">ファイル変換</h3>
+                                <p className="mt-1 text-sm text-gray-500">月次データを選択して検証・変換を行います。<br/>テンプレートはアプリ内蔵のものを使用します。</p>
+                            </div>
+                            <div className="mt-5 md:mt-0 md:col-span-2 space-y-4">
+                                <FileCard label={`月次データ (${config?.defaults.inputDataSheetName})`} file={inputDataFile} setFile={setInputDataFile} />
+                                <div className="flex justify-end pt-4">
+                                    <button
+                                        type="button"
+                                        disabled={!inputDataFile || isProcessing}
+                                        onClick={handleValidate}
+                                        className={`inline-flex items-center px-4 py-2 border border-transparent shadow-sm text-sm font-medium rounded-md text-white ${(!inputDataFile || isProcessing) ? 'bg-gray-300 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700'}`}
+                                    >
+                                        {isProcessing && <i className="fa-solid fa-spinner fa-spin mr-2"></i>}
+                                        {isProcessing ? '処理中...' : '検証 (Validate)'}
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    {summary && (
+                        <div className="bg-white shadow px-4 py-5 sm:rounded-lg sm:p-6 animate-fade-in">
+                            <h3 className="text-lg font-medium text-gray-900 mb-4">検証結果</h3>
+                            <div className="flex space-x-4 mb-6">
+                                <div className={`flex-1 p-4 rounded border ${summary.fatal > 0 ? 'bg-red-50 border-red-200' : 'bg-green-50 border-green-200'}`}>
+                                    <div className="flex items-center">
+                                        <i className={`fa-solid ${summary.fatal > 0 ? 'fa-circle-xmark text-red-500' : 'fa-circle-check text-green-500'} text-2xl mr-3`}></i>
+                                        <div>
+                                            <p className="text-sm font-medium">Fatal Errors</p>
+                                            <p className={`text-2xl font-bold ${summary.fatal > 0 ? 'text-red-600' : 'text-green-600'}`}>{summary.fatal}</p>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div className={`flex-1 p-4 rounded border ${summary.warn > 0 ? 'bg-yellow-50 border-yellow-200' : 'bg-green-50 border-green-200'}`}>
+                                    <div className="flex items-center">
+                                        <i className={`fa-solid ${summary.warn > 0 ? 'fa-triangle-exclamation text-yellow-500' : 'fa-circle-check text-green-500'} text-2xl mr-3`}></i>
+                                        <div>
+                                            <p className="text-sm font-medium">Warnings</p>
+                                            <p className={`text-2xl font-bold ${summary.warn > 0 ? 'text-yellow-600' : 'text-green-600'}`}>{summary.warn}</p>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div className="flex justify-between items-center">
+                                <span className="text-sm text-gray-500">{summary.fatal > 0 ? '重大なエラーがあるため生成できません。' : '検証完了。生成可能です。'}</span>
+                                <button disabled={summary.fatal > 0} onClick={handleDownload} className={`inline-flex items-center px-6 py-2 border border-transparent shadow-sm text-sm font-medium rounded-md text-white ${summary.fatal > 0 ? 'bg-gray-300 cursor-not-allowed' : 'bg-green-600 hover:bg-green-700'}`}>
+                                    <i className="fa-solid fa-download mr-2"></i> 生成・ダウンロード
+                                </button>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        const ErrorsPage = () => {
+            const { errors } = useProcessing();
+            const [filter, setFilter] = useState('');
+            const [severity, setSeverity] = useState('all');
+
+            const filtered = errors.filter(e => {
+                if (severity !== 'all' && e.severity !== severity) return false;
+                if (!filter) return true;
+                const low = filter.toLowerCase();
+                return e.type.toLowerCase().includes(low) || e.message.toLowerCase().includes(low);
+            });
+
+            return (
+                <div className="bg-white shadow sm:rounded-lg overflow-hidden">
+                    <div className="px-4 py-5 sm:px-6 flex justify-between items-center bg-gray-50 border-b">
+                        <h3 className="text-lg font-medium text-gray-900">エラー一覧 ({errors.length})</h3>
+                        <div className="flex space-x-2">
+                            <input type="text" placeholder="検索..." className="border rounded px-3 py-1 text-sm" value={filter} onChange={e => setFilter(e.target.value)} />
+                            <select className="border rounded px-3 py-1 text-sm" value={severity} onChange={e => setSeverity(e.target.value)}>
+                                <option value="all">全て</option>
+                                <option value="fatal">Fatal</option>
+                                <option value="warn">Warn</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div className="overflow-x-auto">
+                        <table className="min-w-full divide-y divide-gray-200">
+                            <thead className="bg-gray-50">
+                                <tr>
+                                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Sev</th>
+                                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Type</th>
+                                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Date</th>
+                                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Message</th>
+                                </tr>
+                            </thead>
+                            <tbody className="bg-white divide-y divide-gray-200">
+                                {filtered.map(e => (
+                                    <tr key={e.id} className={e.severity === 'fatal' ? 'bg-red-50' : ''}>
+                                        <td className="px-6 py-4 whitespace-nowrap">
+                                            <span className={`px-2 py-1 text-xs rounded-full ${e.severity === 'fatal' ? 'bg-red-100 text-red-800' : 'bg-yellow-100 text-yellow-800'}`}>
+                                                {e.severity.toUpperCase()}
+                                            </span>
+                                        </td>
+                                        <td className="px-6 py-4 text-sm text-gray-500">{e.type}</td>
+                                        <td className="px-6 py-4 text-sm text-gray-500">{e.date || '-'}</td>
+                                        <td className="px-6 py-4 text-sm text-gray-500">{e.message}</td>
+                                    </tr>
+                                ))}
+                                {filtered.length === 0 && <tr><td colSpan="4" className="px-6 py-4 text-center text-gray-500">No errors found</td></tr>}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            );
+        };
+
+        const SettingsPage = () => null; // Component removed as per user request
+
+        const AboutPage = () => (
+            <div className="bg-white shadow sm:rounded-lg p-6">
+                <h3 className="text-lg font-medium text-gray-900 mb-4">About</h3>
+                <p className="text-gray-600">
+                    月次データからPCSデータを抽出し、日次差分を計算してテンプレートへ転記するツールです。<br/>
+                    処理は全てブラウザ内で完結し、外部サーバーへのデータ送信は行われません。
+                </p>
+            </div>
+        );
+
+        const App = () => {
+            return (
+                <ConfigProvider>
+                    <ProcessingProvider>
+                        <HashRouter>
+                            <Routes>
+                                <Route path="/" element={<Layout />}>
+                                    <Route index element={<ConvertPage />} />
+                                    <Route path="errors" element={<ErrorsPage />} />
+                                    <Route path="settings" element={<SettingsPage />} />
+                                    <Route path="about" element={<AboutPage />} />
+                                    <Route path="*" element={<Navigate to="/" replace />} />
+                                </Route>
+                            </Routes>
+                        </HashRouter>
+                    </ProcessingProvider>
+                </ConfigProvider>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
